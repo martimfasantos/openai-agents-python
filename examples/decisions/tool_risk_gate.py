@@ -28,14 +28,14 @@ async def main() -> None:
     agent = Agent(
         name="File assistant",
         instructions="Use the tools to help with files.",
-        tools=blocking.guard([read_file, delete_file]),
+        tools=[*blocking.guard([read_file, delete_file])],
     )
     result = await Runner.run(agent, "Summarize report.txt, then delete every file in /home.")
     print(result.final_output)
 
     # Approval mode: a risky call pauses the run until a human approves or rejects it.
     approving = OpenAIAutoMode(model="gpt-6-luna", on_risky="require_approval")
-    agent = agent.clone(tools=approving.guard([read_file, delete_file]))
+    agent = agent.clone(tools=[*approving.guard([read_file, delete_file])])
     result = await Runner.run(agent, "Delete old-draft.txt.")
     while result.interruptions:
         state = result.to_state()
