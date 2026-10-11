@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -8,21 +9,31 @@ import pytest
 from openai import omit
 from openai.types import Decision
 
-from agents import Agent, RunConfig, Runner, WebSearchTool
+from agents import Agent, ModelSettings, RunConfig, Runner, WebSearchTool
 from agents.decorators import tool
 from agents.exceptions import UserError
 from agents.items import ToolCallOutputItem
 from agents.models import _openai_shared, openai_decisions
+from agents.models.default_models import get_default_model_settings
+from agents.models.interface import Model, ModelProvider, ModelTracing
 from agents.models.openai_decisions import (
     DEFAULT_AUTO_MODE_INSTRUCTIONS,
     Choice,
     Level,
+    ModelChoice,
     OpenAIAutoMode,
     OpenAIDecisions,
+    OpenAIModelRouter,
     Predicate,
     Score,
 )
-from agents.testing import ScriptedModel
+from agents.retry import (
+    ModelRetryAdvice,
+    ModelRetryBackoffSettings,
+    ModelRetrySettings,
+    retry_policies,
+)
+from agents.testing import ModelStep, ScriptedModel
 from agents.tool import FunctionTool
 from tests.test_responses import get_function_tool_call, get_text_message
 
@@ -369,3 +380,303 @@ def test_guard_rejects_non_function_tools_and_existing_approval_policies() -> No
         approval_mode.guard([wipe_disk])
     with pytest.raises(UserError, match="FunctionTool"):
         approval_mode.guard([cast(Any, WebSearchTool())])
+
+
+def route_decisions(*routes: str | None) -> tuple[OpenAIDecisions, Any]:
+    client = make_client(
+        *[
+            make_decision(
+                {"type": "refusal", "name": "model_route"}
+                if route is None
+                else {
+                    "type": "choice",
+                    "name": "model_route",
+                    "choice": route,
+                    "confidence": 0.9,
+                    "probabilities": [{"value": route, "probability": 0.9}],
+                }
+            )
+            for route in routes
+        ]
+    )
+    return OpenAIDecisions("gpt-6-luna", openai_client=client), client
+
+
+class CleanupTrackingModel(ScriptedModel):
+    """Records the run owners whose cleanup the router forwards."""
+
+    def __init__(self, steps: list[Any]) -> None:
+        super().__init__(steps)
+        self.cleaned_owners: list[object] = []
+
+    async def _cleanup_on_run_end(self, owner: object) -> None:
+        self.cleaned_owners.append(owner)
+
+
+def make_router(fast: Model, powerful: Model, decisions: OpenAIDecisions) -> OpenAIModelRouter:
+    return OpenAIModelRouter(
+        choices={
+            "fast": ModelChoice(fast, "Simple questions."),
+            "powerful": ModelChoice(powerful, "Hard reasoning."),
+        },
+        instructions="Which model should answer?",
+        default="fast",
+        model=decisions,
+    )
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+async def test_router_classifies_once_per_run_and_uses_the_chosen_model(streamed: bool) -> None:
+    @tool
+    def lookup(term: str) -> str:
+        """Look up a term."""
+        return "found"
+
+    fast = ScriptedModel()
+    powerful = CleanupTrackingModel(
+        [
+            [get_function_tool_call("lookup", '{"term": "BFT"}', call_id="call_1")],
+            [get_text_message("proof")],
+        ]
+    )
+    decisions, client = route_decisions("powerful")
+    router = make_router(fast, powerful, decisions)
+    agent = Agent(name="assistant", model=router, tools=[lookup])
+
+    if streamed:
+        result = Runner.run_streamed(agent, "Prove BFT consensus safety.", run_config=CONFIG)
+        async for _ in result.stream_events():
+            pass
+    else:
+        result = await Runner.run(agent, "Prove BFT consensus safety.", run_config=CONFIG)
+
+    assert result.final_output == "proof"
+    assert len(powerful.calls) == 2
+    assert fast.calls == ()
+    client.decisions.create.assert_awaited_once()
+    kwargs = client.decisions.create.await_args.kwargs
+    assert kwargs["input"] == [{"role": "user", "content": "Prove BFT consensus safety."}]
+    assert kwargs["questions"] == [
+        {
+            "type": "choice",
+            "name": "model_route",
+            "instructions": "Which model should answer?",
+            "choices": [
+                {"value": "fast", "description": "Simple questions."},
+                {"value": "powerful", "description": "Hard reasoning."},
+            ],
+        }
+    ]
+    # The run-end cleanup must release the per-run route and reach the routed model.
+    assert router._routes == {}
+    assert len(powerful.cleaned_owners) == 1
+
+
+async def test_router_outside_a_run_classifies_each_call_and_defaults_without_user_text() -> None:
+    fast = ScriptedModel(
+        [[get_text_message("one")], [get_text_message("two")], [get_text_message("three")]]
+    )
+    decisions, client = route_decisions("fast", "fast")
+    router = make_router(fast, ScriptedModel(), decisions)
+    user_turn: list[Any] = [{"role": "user", "content": "hi"}]
+    tool_turn: list[Any] = [{"type": "function_call_output", "call_id": "call_1", "output": "ok"}]
+
+    for turn in (user_turn, user_turn, tool_turn):
+        await router.get_response(
+            None,
+            turn,
+            ModelSettings(),
+            [],
+            None,
+            [],
+            ModelTracing.DISABLED,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
+        )
+
+    assert len(fast.calls) == 3
+    assert client.decisions.create.await_count == 2
+    assert router._routes == {}
+
+
+async def test_router_uses_default_when_the_route_is_refused() -> None:
+    fast = ScriptedModel([[get_text_message("quick answer")]])
+    decisions, _ = route_decisions(None)
+
+    result = await Runner.run(
+        Agent(name="assistant", model=make_router(fast, ScriptedModel(), decisions)),
+        "What is 2 + 2?",
+        run_config=CONFIG,
+    )
+
+    assert result.final_output == "quick answer"
+
+
+async def test_router_keeps_routes_separate_for_concurrent_runs() -> None:
+    both_runs_routed = asyncio.Event()
+    waiting = 0
+
+    @tool
+    async def wait_for_other_run() -> str:
+        """Wait until the other run reaches its tool call."""
+        nonlocal waiting
+        waiting += 1
+        if waiting == 2:
+            both_runs_routed.set()
+        await both_runs_routed.wait()
+        return "ok"
+
+    def two_turn_model(final_text: str) -> ScriptedModel:
+        return ScriptedModel(
+            [
+                [get_function_tool_call("wait_for_other_run", "{}", call_id="call_1")],
+                [get_text_message(final_text)],
+            ]
+        )
+
+    fast = two_turn_model("fast done")
+    powerful = two_turn_model("powerful done")
+    decisions, client = route_decisions("fast", "powerful")
+    agent = Agent(
+        name="assistant", model=make_router(fast, powerful, decisions), tools=[wait_for_other_run]
+    )
+
+    results = await asyncio.gather(
+        Runner.run(agent, "first", run_config=CONFIG),
+        Runner.run(agent, "second", run_config=CONFIG),
+    )
+
+    assert sorted(result.final_output for result in results) == ["fast done", "powerful done"]
+    assert len(fast.calls) == 2
+    assert len(powerful.calls) == 2
+    assert client.decisions.create.await_count == 2
+
+
+async def test_router_layers_choice_settings_over_the_implicit_defaults() -> None:
+    fast = ScriptedModel([[get_text_message("ok")]])
+    decisions, _ = route_decisions("fast")
+    router = OpenAIModelRouter(
+        choices={
+            "fast": ModelChoice(fast, "Simple.", model_settings=ModelSettings(temperature=0.1)),
+            "powerful": ModelChoice(ScriptedModel(), "Hard."),
+        },
+        instructions="Which model should answer?",
+        default="fast",
+        model=decisions,
+    )
+
+    await Runner.run(Agent(name="assistant", model=router), "hi", run_config=CONFIG)
+
+    assert fast.calls[0].model_settings == ModelSettings(temperature=0.1)
+
+
+async def test_router_resolves_model_names_with_their_own_default_settings(monkeypatch) -> None:
+    resolved = ScriptedModel([[get_text_message("ok")]])
+    names: list[str | None] = []
+
+    class RecordingProvider(ModelProvider):
+        def get_model(self, model_name: str | None) -> Model:
+            names.append(model_name)
+            return resolved
+
+    monkeypatch.setattr(openai_decisions, "MultiProvider", RecordingProvider)
+    decisions, _ = route_decisions("fast")
+    router = OpenAIModelRouter(
+        choices={
+            "fast": ModelChoice("gpt-4.1", "Simple."),
+            "powerful": ModelChoice("gpt-5.5", "Hard."),
+        },
+        instructions="Which model should answer?",
+        default="fast",
+        model=decisions,
+    )
+    # The agent's default settings target the GPT-5 default model, so they must not reach gpt-4.1.
+    assert get_default_model_settings() != ModelSettings()
+
+    await Runner.run(Agent(name="assistant", model=router), "hi", run_config=CONFIG)
+
+    assert names == ["gpt-4.1"]
+    assert resolved.calls[0].model_settings == ModelSettings()
+
+
+async def test_router_forwards_retry_advice_to_the_routed_model() -> None:
+    fast = ScriptedModel(
+        [
+            ModelStep.raise_error(
+                RuntimeError("temporary failure"),
+                retry_advice=ModelRetryAdvice(suggested=True, replay_safety="safe"),
+            ),
+            [get_text_message("recovered")],
+        ]
+    )
+    decisions, client = route_decisions("fast")
+    agent = Agent(
+        name="assistant",
+        model=make_router(fast, ScriptedModel(), decisions),
+        model_settings=ModelSettings(
+            retry=ModelRetrySettings(
+                max_retries=1,
+                backoff=ModelRetryBackoffSettings(initial_delay=0, jitter=False),
+                policy=retry_policies.provider_suggested(),
+            )
+        ),
+    )
+
+    result = await Runner.run(agent, "hi", run_config=CONFIG)
+
+    assert result.final_output == "recovered"
+    client.decisions.create.assert_awaited_once()
+
+
+async def test_router_sends_only_supported_parts_of_the_latest_user_message() -> None:
+    fast = ScriptedModel([[get_text_message("ok")]])
+    decisions, client = route_decisions("fast")
+    user_input: list[Any] = [
+        {"role": "user", "content": "An older question."},
+        {"role": "assistant", "content": "An older answer."},
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Which plan fits this chart?"},
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,AAAA",
+                    "detail": "high",
+                    "file_id": None,
+                },
+                {"type": "input_file", "file_id": "file-123"},
+            ],
+        },
+    ]
+
+    await Runner.run(
+        Agent(name="assistant", model=make_router(fast, ScriptedModel(), decisions)),
+        user_input,
+        run_config=CONFIG,
+    )
+
+    assert client.decisions.create.await_args.kwargs["input"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Which plan fits this chart?"},
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,AAAA",
+                    "detail": "high",
+                },
+                {"type": "input_text", "text": "[input_file omitted]"},
+            ],
+        }
+    ]
+
+
+def test_router_rejects_invalid_choices() -> None:
+    only = {"fast": ModelChoice(ScriptedModel(), "Simple.")}
+    two = {**only, "powerful": ModelChoice(ScriptedModel(), "Hard.")}
+
+    with pytest.raises(UserError, match="at least two"):
+        OpenAIModelRouter(choices=only, instructions="Pick.", default="fast", model="gpt-6-luna")
+    with pytest.raises(UserError, match="default"):
+        OpenAIModelRouter(choices=two, instructions="Pick.", default="other", model="gpt-6-luna")

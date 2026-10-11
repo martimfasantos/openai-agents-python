@@ -8,12 +8,16 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 from openai import AsyncOpenAI, omit
-from openai.types import DecisionInputMessageParam
+from openai.types import (
+    DecisionInputImageParam,
+    DecisionInputMessageParam,
+    DecisionInputPartUnionParam,
+)
 from openai.types.decision import (
     Answer,
     AnswerAnswerResourceChoice,
@@ -27,16 +31,26 @@ from openai.types.decision_create_params import (
     QuestionQuestionParamChoiceChoice,
     QuestionQuestionParamScoreLevel,
 )
+from openai.types.responses.response_prompt_param import ResponsePromptParam
 
+from ..agent_output import AgentOutputSchemaBase
 from ..exceptions import UserError
+from ..handoffs import Handoff
+from ..items import ModelResponse, TResponseInputItem, TResponseStreamEvent
+from ..model_settings import ModelSettings
+from ..retry import ModelRetryAdvice, ModelRetryAdviceRequest
 from ..run_context import RunContextWrapper
-from ..tool import FunctionTool
+from ..tool import FunctionTool, Tool
 from ..tool_guardrails import (
     ToolGuardrailFunctionOutput,
     ToolInputGuardrail,
     ToolInputGuardrailData,
 )
 from ._openai_shared import get_default_openai_client, get_default_openai_key
+from ._run_context import get_model_run_owner
+from .default_models import get_default_model_settings
+from .interface import Model, ModelTracing
+from .multi_provider import MultiProvider
 
 
 @dataclass(frozen=True)
@@ -332,3 +346,191 @@ class OpenAIAutoMode:
         result = await self._decisions.decide(payload, {"is_risky": self._question})
         answer = result.predicates.get("is_risky")
         return None if answer is None else answer.probability
+
+
+@dataclass(frozen=True)
+class ModelChoice:
+    """One model that an `OpenAIModelRouter` can route to."""
+
+    model: str | Model
+    """A model name, resolved the same way as `Agent.model`, or a `Model` instance."""
+
+    criteria: str
+    """When to pick this model. The decisions model reads this description."""
+
+    model_settings: ModelSettings | None = None
+    """Settings layered over the agent's settings when this model is picked."""
+
+
+class OpenAIModelRouter(Model):
+    """A model that uses the Decisions API to pick one of several models for each run.
+
+    The router classifies the latest user message once per run and sends every model call in
+    that run to the chosen model. When the decisions model refuses, or the input has no user
+    message, the router uses `default`.
+
+    With `previous_response_id` or `conversation_id`, different runs of one conversation can
+    route to different models, so every choice must be able to continue that conversation.
+    """
+
+    def __init__(
+        self,
+        *,
+        choices: Mapping[str, ModelChoice],
+        instructions: str,
+        default: str,
+        model: str | OpenAIDecisions,
+    ) -> None:
+        """Create a model router.
+
+        Args:
+            choices: The models to route between, keyed by route name.
+            instructions: What the routing decision is about, for example "Which model should
+                answer this request?".
+            default: The route name to use when no route can be chosen.
+            model: A decisions model name, or an `OpenAIDecisions` client to use.
+        """
+        if len(choices) < 2:
+            raise UserError("OpenAIModelRouter requires at least two choices.")
+        if default not in choices:
+            raise UserError(f"OpenAIModelRouter default {default!r} is not one of its choices.")
+        criteria: dict[str | bool, str | None] = {
+            key: choice.criteria for key, choice in choices.items()
+        }
+        self._choices = dict(choices)
+        self._default = default
+        self._question = Choice(instructions, criteria)
+        self._decisions = OpenAIDecisions(model) if isinstance(model, str) else model
+        self._provider = MultiProvider()
+        self._models: dict[str, Model] = {}
+        self._routes: dict[object, str] = {}
+
+    async def get_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        *,
+        previous_response_id: str | None,
+        conversation_id: str | None,
+        prompt: ResponsePromptParam | None,
+    ) -> ModelResponse:
+        model, settings = await self._route(input, model_settings)
+        return await model.get_response(
+            system_instructions,
+            input,
+            settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            previous_response_id=previous_response_id,
+            conversation_id=conversation_id,
+            prompt=prompt,
+        )
+
+    async def stream_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        *,
+        previous_response_id: str | None,
+        conversation_id: str | None,
+        prompt: ResponsePromptParam | None,
+    ) -> AsyncIterator[TResponseStreamEvent]:
+        model, settings = await self._route(input, model_settings)
+        async for event in model.stream_response(
+            system_instructions,
+            input,
+            settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            previous_response_id=previous_response_id,
+            conversation_id=conversation_id,
+            prompt=prompt,
+        ):
+            yield event
+
+    def get_retry_advice(self, request: ModelRetryAdviceRequest) -> ModelRetryAdvice | None:
+        key = self._routes.get(get_model_run_owner())
+        return None if key is None else self._models[key].get_retry_advice(request)
+
+    async def _cleanup_on_run_end(self, owner: object) -> None:
+        key = self._routes.pop(owner, None)
+        if key is not None:
+            await self._models[key]._cleanup_on_run_end(owner)
+
+    async def _route(
+        self, input: str | list[TResponseInputItem], model_settings: ModelSettings
+    ) -> tuple[Model, ModelSettings]:
+        # The runner sets one owner per run, so a run keeps its route across turns and retries.
+        owner = get_model_run_owner()
+        key = self._routes.get(owner) if owner is not None else None
+        if key is None:
+            key = await self._classify(input)
+            if owner is not None:
+                self._routes[owner] = key
+        choice = self._choices[key]
+        if key not in self._models:
+            self._models[key] = (
+                self._provider.get_model(choice.model)
+                if isinstance(choice.model, str)
+                else choice.model
+            )
+        # Like the runner, replace the implicit defaults with the chosen model's defaults.
+        if model_settings == get_default_model_settings():
+            model_settings = (
+                get_default_model_settings(choice.model)
+                if isinstance(choice.model, str)
+                else ModelSettings()
+            )
+        return self._models[key], model_settings.resolve(choice.model_settings)
+
+    async def _classify(self, input: str | list[TResponseInputItem]) -> str:
+        message = _latest_user_message(input)
+        if message is None:
+            return self._default
+        result = await self._decisions.decide([message], {"model_route": self._question})
+        answer = result.choices.get("model_route")
+        return self._default if answer is None else str(answer.choice)
+
+
+def _latest_user_message(
+    input: str | list[TResponseInputItem],
+) -> DecisionInputMessageParam | None:
+    if isinstance(input, str):
+        return {"role": "user", "content": input}
+    for raw_item in reversed(input):
+        item = cast(dict[str, Any], raw_item)
+        if item.get("role") == "user":
+            return {"role": "user", "content": _decision_content(item.get("content", ""))}
+    return None
+
+
+def _decision_content(content: Any) -> str | list[DecisionInputPartUnionParam]:
+    """Keep the text and image parts the Decisions API accepts, and name the parts it does not."""
+    if isinstance(content, str):
+        return content
+    parts: list[DecisionInputPartUnionParam] = []
+    for part in content:
+        if part.get("type") == "input_text":
+            parts.append({"type": "input_text", "text": part["text"]})
+        elif part.get("type") == "input_image" and part.get("image_url"):
+            image: DecisionInputImageParam = {"type": "input_image", "image_url": part["image_url"]}
+            if part.get("detail"):
+                image["detail"] = part["detail"]
+            parts.append(image)
+        else:
+            parts.append({"type": "input_text", "text": f"[{part.get('type')} omitted]"})
+    return parts
