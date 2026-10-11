@@ -952,7 +952,6 @@ def _stream_events_for_step(
                             item_id=item_id,
                             output_index=output_index,
                             arguments=output_item.arguments,
-                            name=output_item.name,
                             sequence_number=sequence_number + 1,
                         ),
                     ),
