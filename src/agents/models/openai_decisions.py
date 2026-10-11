@@ -251,6 +251,13 @@ class OpenAIAutoMode:
     message saying it was blocked. With `on_risky="require_approval"`, a risky call pauses the run
     for human approval and safe calls run without approval. A call is risky when the risk
     probability is at least `threshold`, or when the decisions model refuses to answer.
+
+    The classifier treats the current run's input as the user's messages. Inside an agent that
+    runs as a tool through `Agent.as_tool()`, that input was written by the calling agent, so guard
+    the outer agent tool instead of the inner agent's tools. With `on_risky="require_approval"`,
+    calls whose arguments the SDK has to convert (for example enums, dates, or omitted defaults)
+    always require approval without being classified; use `on_risky="reject_content"` to classify
+    every call.
     """
 
     def __init__(
@@ -350,9 +357,6 @@ class ModelChoice:
     criteria: str
     """When to pick this model. The decisions model reads this description."""
 
-    model_settings: ModelSettings | None = None
-    """Settings layered over the agent's settings when this model is picked."""
-
 
 class OpenAIModelRouter(Model):
     """A model that uses the Decisions API to pick one of several models for each run.
@@ -386,15 +390,6 @@ class OpenAIModelRouter(Model):
             raise UserError("OpenAIModelRouter requires at least two choices.")
         if default not in choices:
             raise UserError(f"OpenAIModelRouter default {default!r} is not one of its choices.")
-        for key, choice in choices.items():
-            settings = choice.model_settings
-            if settings is not None and (
-                settings.timeout is not None or settings.retry is not None
-            ):
-                raise UserError(
-                    f"ModelChoice {key!r} sets timeout or retry, but the runner reads timeout and "
-                    "retry from the agent's model_settings. Set them there instead."
-                )
         criteria: dict[str | bool, str | None] = {
             key: choice.criteria for key, choice in choices.items()
         }
@@ -474,6 +469,10 @@ class OpenAIModelRouter(Model):
         key = self._routes.get(get_model_run_owner())
         return None if key is None else self._models[key].get_retry_advice(request)
 
+    async def close(self) -> None:
+        """Release the connections held by models this router resolved from model names."""
+        await self._provider.aclose()
+
     async def _cleanup_on_run_end(self, owner: object) -> None:
         key = self._routes.pop(owner, None)
         if key is not None:
@@ -501,7 +500,7 @@ class OpenAIModelRouter(Model):
         # would have applied to this model name.
         if model_settings == ModelSettings() and isinstance(choice.model, str):
             model_settings = get_default_model_settings(choice.model)
-        return self._models[key], model_settings.resolve(choice.model_settings)
+        return self._models[key], model_settings
 
     async def _classify(self, input: str | list[TResponseInputItem]) -> str:
         message = _latest_user_message(input)

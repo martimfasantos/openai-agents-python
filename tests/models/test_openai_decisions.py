@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator
+from enum import Enum
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -359,6 +360,29 @@ async def test_require_approval_mode_interrupts_risky_calls_and_resumes_after_ap
     assert client.decisions.create.await_count == 1
 
 
+class Speed(Enum):
+    SLOW = "slow"
+    FAST = "fast"
+
+
+async def test_require_approval_mode_pauses_calls_whose_arguments_need_conversion() -> None:
+    @tool
+    def set_speed(speed: Speed) -> str:
+        """Set the fan speed."""
+        return speed.value
+
+    decisions, client = risk_decisions(0.01)
+    [guarded] = OpenAIAutoMode(model=decisions, on_risky="require_approval").guard([set_speed])
+
+    result = await Runner.run(
+        agent_calling(guarded, '{"speed": "slow"}'), "Slow the fan down", run_config=CONFIG
+    )
+
+    # The SDK requires approval before converting arguments, so the classifier is never asked.
+    assert len(result.interruptions) == 1
+    client.decisions.create.assert_not_awaited()
+
+
 async def test_classification_errors_fail_the_run_without_running_the_tool() -> None:
     calls: list[str] = []
     client = MagicMock()
@@ -567,24 +591,6 @@ async def test_router_keeps_routes_separate_for_concurrent_runs() -> None:
     assert client.decisions.create.await_count == 2
 
 
-async def test_router_layers_choice_settings_over_the_implicit_defaults() -> None:
-    fast = ScriptedModel([[get_text_message("ok")]])
-    decisions, _ = route_decisions("fast")
-    router = OpenAIModelRouter(
-        choices={
-            "fast": ModelChoice(fast, "Simple.", model_settings=ModelSettings(temperature=0.1)),
-            "powerful": ModelChoice(ScriptedModel(), "Hard."),
-        },
-        instructions="Which model should answer?",
-        default="fast",
-        model=decisions,
-    )
-
-    await Runner.run(Agent(name="assistant", model=router), "hi", run_config=CONFIG)
-
-    assert fast.calls[0].model_settings == ModelSettings(temperature=0.1)
-
-
 @pytest.mark.parametrize("router_on", ["agent", "run_config"])
 async def test_router_resolves_model_names_with_their_own_default_settings(
     monkeypatch, router_on: str
@@ -758,18 +764,33 @@ def test_router_rejects_invalid_choices() -> None:
         OpenAIModelRouter(choices=two, instructions="Pick.", default="other", model="gpt-6-luna")
 
 
-@pytest.mark.parametrize(
-    "settings",
-    [
-        ModelSettings(timeout=1.0),
-        ModelSettings(retry=ModelRetrySettings(max_retries=1)),
-    ],
-)
-def test_router_rejects_choice_settings_that_the_runner_owns(settings: ModelSettings) -> None:
-    choices = {
-        "fast": ModelChoice(ScriptedModel(), "Simple.", model_settings=settings),
-        "powerful": ModelChoice(ScriptedModel(), "Hard."),
-    }
+async def test_router_passes_explicit_agent_settings_to_the_chosen_model() -> None:
+    fast = ScriptedModel([[get_text_message("ok")]])
+    decisions, _ = route_decisions("fast")
+    agent = Agent(
+        name="assistant",
+        model=make_router(fast, ScriptedModel(), decisions),
+        model_settings=ModelSettings(temperature=0.2),
+    )
 
-    with pytest.raises(UserError, match="timeout and retry"):
-        OpenAIModelRouter(choices=choices, instructions="Pick.", default="fast", model="gpt-6-luna")
+    await Runner.run(agent, "hi", run_config=CONFIG)
+
+    assert fast.calls[0].model_settings == ModelSettings(temperature=0.2)
+
+
+async def test_router_close_releases_the_provider_it_owns(monkeypatch) -> None:
+    closed: list[bool] = []
+
+    class RecordingProvider(ModelProvider):
+        def get_model(self, model_name: str | None) -> Model:
+            return ScriptedModel()
+
+        async def aclose(self) -> None:
+            closed.append(True)
+
+    monkeypatch.setattr(openai_decisions, "MultiProvider", RecordingProvider)
+    router = make_router(ScriptedModel(), ScriptedModel(), route_decisions()[0])
+
+    await router.close()
+
+    assert closed == [True]
