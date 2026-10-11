@@ -794,3 +794,73 @@ async def test_router_close_releases_the_provider_it_owns(monkeypatch) -> None:
     await router.close()
 
     assert closed == [True]
+
+
+async def test_classification_keeps_json_schemas_from_replayed_history() -> None:
+    @tool
+    def read_file(path: str) -> str:
+        """Read a file."""
+        return "contents"
+
+    decisions, client = risk_decisions(0.1)
+    [guarded] = OpenAIAutoMode(model=decisions).guard([read_file])
+    schema = {
+        "type": "object",
+        "properties": {"type": {"type": "string"}, "limit": {"type": ["integer", "null"]}},
+    }
+    user_input: list[Any] = [
+        {
+            "type": "mcp_list_tools",
+            "id": "list_1",
+            "server_label": "docs",
+            "tools": [{"name": "search", "input_schema": schema}],
+        },
+        {"role": "user", "content": "Read notes.txt"},
+    ]
+
+    result = await Runner.run(
+        agent_calling(guarded, '{"path": "notes.txt"}'), user_input, run_config=CONFIG
+    )
+
+    assert result.final_output == "done"
+    payload = json.loads(client.decisions.create.await_args.kwargs["input"])
+    assert payload["messages"][0]["tools"][0]["input_schema"] == schema
+
+
+async def test_router_resolves_model_names_once_per_run(monkeypatch) -> None:
+    names: list[str | None] = []
+
+    @tool
+    def lookup(term: str) -> str:
+        """Look up a term."""
+        return "found"
+
+    class RecordingProvider(ModelProvider):
+        def get_model(self, model_name: str | None) -> Model:
+            names.append(model_name)
+            return ScriptedModel(
+                [
+                    [get_function_tool_call("lookup", '{"term": "x"}', call_id="call_1")],
+                    [get_text_message("ok")],
+                ]
+            )
+
+    monkeypatch.setattr(openai_decisions, "MultiProvider", RecordingProvider)
+    decisions, _ = route_decisions("fast", "fast")
+    router = OpenAIModelRouter(
+        choices={
+            "fast": ModelChoice("gpt-5.6-luna", "Simple."),
+            "powerful": ModelChoice("gpt-5.5", "Hard."),
+        },
+        instructions="Which model should answer?",
+        default="fast",
+        model=decisions,
+    )
+    agent = Agent(name="assistant", model=router, tools=[lookup])
+
+    for question in ("first", "second"):
+        result = await Runner.run(agent, question, run_config=CONFIG)
+        assert result.final_output == "ok"
+
+    # Each run looks the model up once, so the provider tracks the instance that run uses.
+    assert names == ["gpt-5.6-luna", "gpt-5.6-luna"]

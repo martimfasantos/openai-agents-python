@@ -236,8 +236,10 @@ _MEDIA_TYPES = frozenset(
 def _omit_media(value: Any) -> Any:
     """Replace media parts with short placeholders so classification input stays small."""
     if isinstance(value, dict):
-        if value.get("type") in _MEDIA_TYPES:
-            return f"[{value['type']} omitted]"
+        # JSON schemas in the history can hold a dict or list under "type", so check strings only.
+        item_type = value.get("type")
+        if isinstance(item_type, str) and item_type in _MEDIA_TYPES:
+            return f"[{item_type} omitted]"
         return {key: _omit_media(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_omit_media(item) for item in value]
@@ -398,8 +400,7 @@ class OpenAIModelRouter(Model):
         self._question = Choice(instructions, criteria)
         self._decisions = OpenAIDecisions(model) if isinstance(model, str) else model
         self._provider = MultiProvider()
-        self._models: dict[str, Model] = {}
-        self._routes: dict[object, str] = {}
+        self._routes: dict[object, tuple[str, Model]] = {}
 
     async def get_response(
         self,
@@ -466,41 +467,44 @@ class OpenAIModelRouter(Model):
                 await aclose()
 
     def get_retry_advice(self, request: ModelRetryAdviceRequest) -> ModelRetryAdvice | None:
-        key = self._routes.get(get_model_run_owner())
-        return None if key is None else self._models[key].get_retry_advice(request)
+        route = self._routes.get(get_model_run_owner())
+        return None if route is None else route[1].get_retry_advice(request)
 
     async def close(self) -> None:
         """Release the connections held by models this router resolved from model names."""
         await self._provider.aclose()
 
     async def _cleanup_on_run_end(self, owner: object) -> None:
-        key = self._routes.pop(owner, None)
-        if key is not None:
-            await self._models[key]._cleanup_on_run_end(owner)
+        route = self._routes.pop(owner, None)
+        if route is not None:
+            await route[1]._cleanup_on_run_end(owner)
 
     async def _route(
         self, input: str | list[TResponseInputItem], model_settings: ModelSettings
     ) -> tuple[Model, ModelSettings]:
-        # The runner sets one owner per run, so a run keeps its route across turns and retries.
+        # The runner sets one owner per run, so a run keeps its route and model across turns and
+        # retries. Model names are looked up once per run, like the runner does for its provider.
         owner = get_model_run_owner()
-        key = self._routes.get(owner) if owner is not None else None
-        if key is None:
+        route = self._routes.get(owner) if owner is not None else None
+        if route is None:
             key = await self._classify(input)
-        choice = self._choices[key]
-        if key not in self._models:
-            self._models[key] = (
-                self._provider.get_model(choice.model)
-                if isinstance(choice.model, str)
-                else choice.model
+            choice_model = self._choices[key].model
+            model = (
+                self._provider.get_model(choice_model)
+                if isinstance(choice_model, str)
+                else choice_model
             )
-        # The route is stored only after the model resolves, so a failed run leaves no route.
-        if owner is not None:
-            self._routes[owner] = key
+            route = (key, model)
+            # The route is stored only after the model resolves, so a failed run leaves none.
+            if owner is not None:
+                self._routes[owner] = route
+        key, model = route
+        choice = self._choices[key]
         # The runner passes plain ModelSettings() to a Model instance, so apply the defaults it
         # would have applied to this model name.
         if model_settings == ModelSettings() and isinstance(choice.model, str):
             model_settings = get_default_model_settings(choice.model)
-        return self._models[key], model_settings
+        return model, model_settings
 
     async def _classify(self, input: str | list[TResponseInputItem]) -> str:
         message = _latest_user_message(input)
