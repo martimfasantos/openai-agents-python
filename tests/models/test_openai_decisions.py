@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncGenerator
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -14,7 +15,6 @@ from agents.decorators import tool
 from agents.exceptions import UserError
 from agents.items import ToolCallOutputItem
 from agents.models import _openai_shared, openai_decisions
-from agents.models.default_models import get_default_model_settings
 from agents.models.interface import Model, ModelProvider, ModelTracing
 from agents.models.openai_decisions import (
     DEFAULT_AUTO_MODE_INSTRUCTIONS,
@@ -278,6 +278,17 @@ async def test_classification_payload_has_user_context_and_tool_call_without_med
     [guarded] = OpenAIAutoMode(model=decisions).guard([send_email])
     user_input: list[Any] = [
         {
+            "type": "computer_call_output",
+            "call_id": "computer_1",
+            "output": {"type": "computer_screenshot", "image_url": "data:image/png;base64,SHOT"},
+        },
+        {
+            "type": "image_generation_call",
+            "id": "image_1",
+            "status": "completed",
+            "result": "GENERATED_IMAGE_BYTES",
+        },
+        {
             "role": "user",
             "content": [
                 {"type": "input_text", "text": "Email the report to Ana."},
@@ -287,7 +298,7 @@ async def test_classification_payload_has_user_context_and_tool_call_without_med
                     "detail": "auto",
                 },
             ],
-        }
+        },
     ]
 
     await Runner.run(
@@ -299,7 +310,10 @@ async def test_classification_payload_has_user_context_and_tool_call_without_med
         {"type": "predicate", "name": "is_risky", "instructions": DEFAULT_AUTO_MODE_INSTRUCTIONS}
     ]
     assert "base64" not in kwargs["input"]
+    assert "GENERATED_IMAGE_BYTES" not in kwargs["input"]
     payload = json.loads(kwargs["input"])
+    assert payload["messages"][0]["output"] == "[computer_screenshot omitted]"
+    assert payload["messages"][1] == "[image_generation_call omitted]"
     assert payload["messages"][-1]["role"] == "user"
     assert payload["messages"][-1]["content"] == [
         {"type": "input_text", "text": "Email the report to Ana."},
@@ -571,7 +585,10 @@ async def test_router_layers_choice_settings_over_the_implicit_defaults() -> Non
     assert fast.calls[0].model_settings == ModelSettings(temperature=0.1)
 
 
-async def test_router_resolves_model_names_with_their_own_default_settings(monkeypatch) -> None:
+@pytest.mark.parametrize("router_on", ["agent", "run_config"])
+async def test_router_resolves_model_names_with_their_own_default_settings(
+    monkeypatch, router_on: str
+) -> None:
     resolved = ScriptedModel([[get_text_message("ok")]])
     names: list[str | None] = []
 
@@ -584,20 +601,77 @@ async def test_router_resolves_model_names_with_their_own_default_settings(monke
     decisions, _ = route_decisions("fast")
     router = OpenAIModelRouter(
         choices={
-            "fast": ModelChoice("gpt-4.1", "Simple."),
+            "fast": ModelChoice("gpt-5.6-luna", "Simple."),
             "powerful": ModelChoice("gpt-5.5", "Hard."),
         },
         instructions="Which model should answer?",
         default="fast",
         model=decisions,
     )
-    # The agent's default settings target the GPT-5 default model, so they must not reach gpt-4.1.
-    assert get_default_model_settings() != ModelSettings()
 
-    await Runner.run(Agent(name="assistant", model=router), "hi", run_config=CONFIG)
+    if router_on == "agent":
+        await Runner.run(Agent(name="assistant", model=router), "hi", run_config=CONFIG)
+    else:
+        run_config = RunConfig(tracing_disabled=True, model=router)
+        await Runner.run(Agent(name="assistant"), "hi", run_config=run_config)
 
-    assert names == ["gpt-4.1"]
-    assert resolved.calls[0].model_settings == ModelSettings()
+    assert names == ["gpt-5.6-luna"]
+    # GPT-5 models default to low verbosity, which a plain ModelSettings() would not set.
+    assert resolved.calls[0].model_settings.verbosity == "low"
+
+
+async def test_router_surfaces_model_resolution_errors() -> None:
+    decisions, _ = route_decisions("fast")
+    router = OpenAIModelRouter(
+        choices={
+            "fast": ModelChoice("unknown-provider/model", "Simple."),
+            "powerful": ModelChoice(ScriptedModel(), "Hard."),
+        },
+        instructions="Which model should answer?",
+        default="fast",
+        model=decisions,
+    )
+
+    with pytest.raises(UserError, match="Unknown prefix"):
+        await Runner.run(Agent(name="assistant", model=router), "hi", run_config=CONFIG)
+
+
+async def test_router_closes_the_inner_stream_when_the_caller_stops_early() -> None:
+    class TrackedStreamModel(ScriptedModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.closed = False
+
+        async def stream_response(self, *args: Any, **kwargs: Any) -> Any:
+            try:
+                yield "first event"
+                yield "second event"
+            finally:
+                self.closed = True
+
+    inner = TrackedStreamModel()
+    decisions, _ = route_decisions("fast")
+    router = make_router(inner, ScriptedModel(), decisions)
+    stream = cast(
+        AsyncGenerator[Any, None],
+        router.stream_response(
+            None,
+            "hi",
+            ModelSettings(),
+            [],
+            None,
+            [],
+            ModelTracing.DISABLED,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
+        ),
+    )
+
+    assert await stream.__anext__() == "first event"
+    await stream.aclose()
+
+    assert inner.closed
 
 
 async def test_router_forwards_retry_advice_to_the_routed_model() -> None:
@@ -645,6 +719,7 @@ async def test_router_sends_only_supported_parts_of_the_latest_user_message() ->
                     "detail": "high",
                     "file_id": None,
                 },
+                {"type": "input_image", "image_url": "https://example.com/chart.png"},
                 {"type": "input_file", "file_id": "file-123"},
             ],
         },
@@ -666,6 +741,7 @@ async def test_router_sends_only_supported_parts_of_the_latest_user_message() ->
                     "image_url": "data:image/png;base64,AAAA",
                     "detail": "high",
                 },
+                {"type": "input_text", "text": "[input_image omitted]"},
                 {"type": "input_text", "text": "[input_file omitted]"},
             ],
         }
@@ -680,3 +756,20 @@ def test_router_rejects_invalid_choices() -> None:
         OpenAIModelRouter(choices=only, instructions="Pick.", default="fast", model="gpt-6-luna")
     with pytest.raises(UserError, match="default"):
         OpenAIModelRouter(choices=two, instructions="Pick.", default="other", model="gpt-6-luna")
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        ModelSettings(timeout=1.0),
+        ModelSettings(retry=ModelRetrySettings(max_retries=1)),
+    ],
+)
+def test_router_rejects_choice_settings_that_the_runner_owns(settings: ModelSettings) -> None:
+    choices = {
+        "fast": ModelChoice(ScriptedModel(), "Simple.", model_settings=settings),
+        "powerful": ModelChoice(ScriptedModel(), "Hard."),
+    }
+
+    with pytest.raises(UserError, match="timeout and retry"):
+        OpenAIModelRouter(choices=choices, instructions="Pick.", default="fast", model="gpt-6-luna")

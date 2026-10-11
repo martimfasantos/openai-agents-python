@@ -10,7 +10,7 @@ import copy
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 
 from openai import AsyncOpenAI, omit
 from openai.types import (
@@ -119,6 +119,9 @@ class Score:
         return {"type": "score", "name": name, "instructions": self.instructions, "levels": levels}
 
 
+_AnswerT = TypeVar("_AnswerT")
+
+
 @dataclass(frozen=True)
 class DecisionResult:
     """The answers from one Decisions API request, keyed by question name."""
@@ -135,41 +138,28 @@ class DecisionResult:
     request_id: str | None
     """The `x-request-id` of the API response."""
 
+    def _answers_of(self, kind: type[_AnswerT]) -> dict[str, _AnswerT]:
+        return {name: answer for name, answer in self.answers.items() if isinstance(answer, kind)}
+
     @property
     def predicates(self) -> dict[str, AnswerAnswerResourcePredicate]:
         """Predicate answers by question name."""
-        return {
-            name: answer
-            for name, answer in self.answers.items()
-            if isinstance(answer, AnswerAnswerResourcePredicate)
-        }
+        return self._answers_of(AnswerAnswerResourcePredicate)
 
     @property
     def choices(self) -> dict[str, AnswerAnswerResourceChoice]:
         """Choice answers by question name."""
-        return {
-            name: answer
-            for name, answer in self.answers.items()
-            if isinstance(answer, AnswerAnswerResourceChoice)
-        }
+        return self._answers_of(AnswerAnswerResourceChoice)
 
     @property
     def scores(self) -> dict[str, AnswerAnswerResourceScore]:
         """Score answers by question name."""
-        return {
-            name: answer
-            for name, answer in self.answers.items()
-            if isinstance(answer, AnswerAnswerResourceScore)
-        }
+        return self._answers_of(AnswerAnswerResourceScore)
 
     @property
     def refusals(self) -> dict[str, AnswerAnswerResourceRefusal]:
         """Questions the model declined to answer, by question name."""
-        return {
-            name: answer
-            for name, answer in self.answers.items()
-            if isinstance(answer, AnswerAnswerResourceRefusal)
-        }
+        return self._answers_of(AnswerAnswerResourceRefusal)
 
 
 class OpenAIDecisions:
@@ -238,7 +228,9 @@ DEFAULT_AUTO_MODE_INSTRUCTIONS = (
     "request. Answer no if the call is low risk, reversible, and clearly authorized by the user."
 )
 
-_MEDIA_TYPES = frozenset({"input_image", "input_file", "input_audio"})
+_MEDIA_TYPES = frozenset(
+    {"input_image", "input_file", "input_audio", "computer_screenshot", "image_generation_call"}
+)
 
 
 def _omit_media(value: Any) -> Any:
@@ -285,9 +277,9 @@ class OpenAIAutoMode:
 
     def guard(self, tools: list[FunctionTool]) -> list[FunctionTool]:
         """Return copies of `tools` that are classified before every call."""
-        if any(not isinstance(tool, FunctionTool) for tool in tools):
-            raise UserError("OpenAIAutoMode.guard() only supports FunctionTool instances.")
         for tool in tools:
+            if not isinstance(tool, FunctionTool):
+                raise UserError("OpenAIAutoMode.guard() only supports FunctionTool instances.")
             if self._on_risky == "require_approval" and tool.needs_approval is not False:
                 raise UserError(
                     f"Tool `{tool.name}` already sets needs_approval, so OpenAIAutoMode cannot "
@@ -394,6 +386,15 @@ class OpenAIModelRouter(Model):
             raise UserError("OpenAIModelRouter requires at least two choices.")
         if default not in choices:
             raise UserError(f"OpenAIModelRouter default {default!r} is not one of its choices.")
+        for key, choice in choices.items():
+            settings = choice.model_settings
+            if settings is not None and (
+                settings.timeout is not None or settings.retry is not None
+            ):
+                raise UserError(
+                    f"ModelChoice {key!r} sets timeout or retry, but the runner reads timeout and "
+                    "retry from the agent's model_settings. Set them there instead."
+                )
         criteria: dict[str | bool, str | None] = {
             key: choice.criteria for key, choice in choices.items()
         }
@@ -448,7 +449,7 @@ class OpenAIModelRouter(Model):
         prompt: ResponsePromptParam | None,
     ) -> AsyncIterator[TResponseStreamEvent]:
         model, settings = await self._route(input, model_settings)
-        async for event in model.stream_response(
+        stream = model.stream_response(
             system_instructions,
             input,
             settings,
@@ -459,8 +460,15 @@ class OpenAIModelRouter(Model):
             previous_response_id=previous_response_id,
             conversation_id=conversation_id,
             prompt=prompt,
-        ):
-            yield event
+        )
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            # Like the runner, close the inner stream in this task when the caller stops early.
+            aclose = getattr(stream, "aclose", None)
+            if callable(aclose):
+                await aclose()
 
     def get_retry_advice(self, request: ModelRetryAdviceRequest) -> ModelRetryAdvice | None:
         key = self._routes.get(get_model_run_owner())
@@ -479,8 +487,6 @@ class OpenAIModelRouter(Model):
         key = self._routes.get(owner) if owner is not None else None
         if key is None:
             key = await self._classify(input)
-            if owner is not None:
-                self._routes[owner] = key
         choice = self._choices[key]
         if key not in self._models:
             self._models[key] = (
@@ -488,13 +494,13 @@ class OpenAIModelRouter(Model):
                 if isinstance(choice.model, str)
                 else choice.model
             )
-        # Like the runner, replace the implicit defaults with the chosen model's defaults.
-        if model_settings == get_default_model_settings():
-            model_settings = (
-                get_default_model_settings(choice.model)
-                if isinstance(choice.model, str)
-                else ModelSettings()
-            )
+        # The route is stored only after the model resolves, so a failed run leaves no route.
+        if owner is not None:
+            self._routes[owner] = key
+        # The runner passes plain ModelSettings() to a Model instance, so apply the defaults it
+        # would have applied to this model name.
+        if model_settings == ModelSettings() and isinstance(choice.model, str):
+            model_settings = get_default_model_settings(choice.model)
         return self._models[key], model_settings.resolve(choice.model_settings)
 
     async def _classify(self, input: str | list[TResponseInputItem]) -> str:
@@ -526,7 +532,7 @@ def _decision_content(content: Any) -> str | list[DecisionInputPartUnionParam]:
     for part in content:
         if part.get("type") == "input_text":
             parts.append({"type": "input_text", "text": part["text"]})
-        elif part.get("type") == "input_image" and part.get("image_url"):
+        elif part.get("type") == "input_image" and str(part.get("image_url")).startswith("data:"):
             image: DecisionInputImageParam = {"type": "input_image", "image_url": part["image_url"]}
             if part.get("detail"):
                 image["detail"] = part["detail"]
