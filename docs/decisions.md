@@ -47,7 +47,7 @@ The three question types are:
 |---|---|
 | [`Predicate`][agents.models.openai_decisions.Predicate] | The probability that the condition is true. |
 | [`Choice`][agents.models.openai_decisions.Choice] | One of the allowed values, a probability for each value, and a confidence. Values can be strings or booleans, and each value can have an optional description. |
-| [`Score`][agents.models.openai_decisions.Score] | A position on an ordered scale of two to ten levels, from lowest to highest. The `score` is the probability-weighted level index, so the `score` can fall between two levels. A [`Level`][agents.models.openai_decisions.Level] adds an optional description to a level label. |
+| [`Score`][agents.models.openai_decisions.Score] | A position on an ordered scale of levels, from lowest to highest. The `score` is the probability-weighted level index, so the `score` can fall between two levels. A [`Level`][agents.models.openai_decisions.Level] adds an optional description to a level label. |
 
 `decide()` returns a [`DecisionResult`][agents.models.openai_decisions.DecisionResult]. The `answers` dictionary holds every answer by question name, and the `predicates`, `choices`, `scores`, and `refusals` dictionaries hold the answers of each type. The Decisions API can decline to answer one question while it still answers the other questions, so check `refusals` or use `.get()` when you read an answer. `DecisionResult` also includes the `model`, the token `usage`, and the `request_id` of the API response.
 
@@ -126,14 +126,14 @@ The `on_risky` argument controls what happens to a risky call:
 | `"reject_content"` (default) | The tool does not run. The model receives a message that says the call was blocked, and the run continues. | The tool runs. |
 | `"require_approval"` | The run pauses with a tool approval interruption, as described in [Human-in-the-loop](human_in_the_loop.md). After a person approves the call and the run resumes, the tool runs without a second classification. | The tool runs without approval. |
 
-In `"reject_content"` mode, `OpenAIAutoMode` adds a [tool input guardrail](guardrails.md#tool-guardrails) to each copy. In `"require_approval"` mode, `OpenAIAutoMode` sets `needs_approval` on each copy, so `guard()` raises a `UserError` for a tool that already sets `needs_approval`. `guard()` also raises a `UserError` for any tool that is not a `FunctionTool`.
+In `"reject_content"` mode, `OpenAIAutoMode` adds a [tool input guardrail](guardrails.md#tool-guardrails) to each copy. In `"require_approval"` mode, `OpenAIAutoMode` sets `needs_approval` on each copy, so `guard()` raises a `UserError` for a tool whose `needs_approval` is not `False`. `guard()` also raises a `UserError` for any tool that is not a `FunctionTool`.
 
 A call is risky when the risk probability is at least `threshold` (default `0.5`), or when the Decisions API declines to answer. If the Decisions API request fails, the run stops before the tool runs. Tune `threshold` with labeled examples from your application, and pass `instructions` to replace [`DEFAULT_AUTO_MODE_INSTRUCTIONS`][agents.models.openai_decisions.DEFAULT_AUTO_MODE_INSTRUCTIONS] with your own risk policy.
 
 For each guarded call, the Decisions API receives the following information:
 
 -   The latest 30 items of the run input, with images, files, audio, screenshots, and generated images replaced by short placeholders.
--   The namespace-qualified tool name and the raw tool arguments.
+-   The namespace-qualified tool name and the tool arguments.
 -   The tool description.
 
 The default instructions tell the classifier to treat all of this information as data, and to accept only explicit requests in user messages as authorization.
@@ -141,10 +141,10 @@ The default instructions tell the classifier to treat all of this information as
 ### Auto mode limitations
 
 -   In an agent that runs as a tool through [`Agent.as_tool()`][agents.agent.Agent.as_tool], the run input was written by the calling agent, not by the user. Guard the outer agent tool instead of the inner agent's tools.
--   In `"require_approval"` mode, the SDK requires approval without calling `needs_approval` when the SDK must convert the tool arguments, for example for enums, dates, or omitted defaults. These calls always pause for approval without classification. Use `"reject_content"` mode to classify every call.
--   The classifier does not see authorization that a user gives only inside an attachment, or in input items older than the latest 30 items. The classifier treats these calls as unauthorized.
+-   In `"require_approval"` mode, the SDK requires approval without calling `needs_approval` when the SDK must convert the tool arguments (for example, for enums, dates, or omitted defaults) or cannot parse the tool arguments. These calls always pause for approval without classification. Use `"reject_content"` mode to classify every call.
+-   The classifier does not see authorization that a user gives only inside an attachment, or in input items older than the latest 30 items. Calls that rely on such authorization are likely to be classified as unauthorized.
 -   In `"require_approval"` mode, apply [`tool_namespace()`][agents.tool.tool_namespace] before `guard()`, so that the classifier receives the namespaced tool name.
--   Realtime sessions do not provide the conversation to tools, so the classifier sees only the tool call for realtime agent tools.
+-   Realtime sessions do not provide the conversation to tools, so the classifier sees only the tool call and the tool description for realtime agent tools.
 
 ## Route a run to a model
 
@@ -175,7 +175,7 @@ async def answer(question: str) -> str:
     return str(run.final_output)
 ```
 
-`agent.clone()` resolves the chosen model name with the model provider of the run, and applies the default model settings of the chosen model.
+The run resolves the chosen model name with the model provider of the run. Because `agent` uses the implicit default model settings, `agent.clone(model=...)` also replaces those settings with the default model settings of the chosen model.
 
 ## Examples
 
