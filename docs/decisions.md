@@ -175,7 +175,7 @@ async def answer(question: str) -> str:
     return str(run.final_output)
 ```
 
-The run resolves the chosen model name with the model provider of the run. Because `agent` uses the implicit default model settings, `agent.clone(model=...)` also replaces those settings with the default model settings of the chosen model.
+The run resolves the chosen model name by using the model provider of the run. Because `agent` does not set `model_settings`, `agent.clone(model=...)` also replaces the model settings of `agent` with the default model settings of the chosen model.
 
 ## Examples
 
