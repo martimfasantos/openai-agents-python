@@ -70,6 +70,7 @@ plugins:
                 - Models: models/index.md
                 - Tools: tools.md
                 - Guardrails: guardrails.md
+                - Decisions API: decisions.md
                 - Running agents: running_agents.md
                 - Streaming: streaming.md
                 - Agent orchestration: multi_agent.md
@@ -146,6 +147,7 @@ plugins:
                     - OpenAI Responses model: ref/models/openai_responses.md
                     - OpenAI provider: ref/models/openai_provider.md
                     - Multi provider: ref/models/multi_provider.md
+                    - OpenAI Decisions: ref/models/openai_decisions.md
                     - MCP servers: ref/mcp/server.md
                     - MCP util: ref/mcp/util.md
                     - MCP manager: ref/mcp/manager.md
