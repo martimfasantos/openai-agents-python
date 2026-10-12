@@ -478,3 +478,21 @@ async def test_classification_sends_only_the_latest_run_input_items() -> None:
     assert [item["content"] for item in payload["messages"]] == [
         f"message {index}" for index in range(1, 31)
     ]
+
+
+async def test_require_approval_mode_classifies_with_the_namespaced_tool_name() -> None:
+    decisions, client = risk_decisions(0.9)
+    [guarded] = OpenAIAutoMode(model=decisions, on_risky="require_approval").guard(
+        tool_namespace(name="files", description="File tools.", tools=[delete_file_tool([])])
+    )
+    model = ScriptedModel(
+        [[function_call("delete_file", '{"path": "a.txt"}', call_id="call_1", namespace="files")]]
+    )
+
+    result = await Runner.run(
+        Agent(name="assistant", model=model, tools=[guarded]), "hi", run_config=CONFIG
+    )
+
+    assert len(result.interruptions) == 1
+    payload = json.loads(client.decisions.create.await_args.kwargs["input"])
+    assert payload["tool_call"]["name"] == "files.delete_file"
