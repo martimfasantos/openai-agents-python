@@ -23,8 +23,9 @@ from agents.models.openai_decisions import (
     Predicate,
     Score,
 )
-from agents.testing import ScriptedModel
-from agents.tool import FunctionTool
+from agents.models.openai_provider import shared_http_client
+from agents.testing import ScriptedModel, function_call
+from agents.tool import FunctionTool, tool_namespace
 from tests.test_responses import get_function_tool_call, get_text_message
 
 USAGE = {
@@ -36,17 +37,17 @@ USAGE = {
 }
 
 
-def make_decision(*answers: dict[str, Any], request_id: str | None = "req_123") -> Decision:
+def make_decision(*answers: dict[str, Any]) -> Decision:
     decision = Decision.model_validate(
         {"model": "gpt-6-luna", "answers": list(answers), "usage": USAGE}
     )
-    decision._request_id = request_id
+    decision._request_id = "req_123"
     return decision
 
 
-def make_client(*decisions: Decision) -> Any:
+def make_client(*results: Decision | Exception) -> Any:
     client = MagicMock()
-    client.decisions.create = AsyncMock(side_effect=list(decisions))
+    client.decisions.create = AsyncMock(side_effect=list(results))
     return client
 
 
@@ -189,7 +190,7 @@ async def test_default_key_builds_a_client_lazily(monkeypatch) -> None:
     assert created == []
 
     await decisions.decide("text", {"q": Predicate("Is it true?")})
-    assert created == [{"api_key": "sk-test-key"}]
+    assert created == [{"api_key": "sk-test-key", "http_client": shared_http_client()}]
 
 
 CONFIG = RunConfig(tracing_disabled=True)
@@ -374,8 +375,7 @@ async def test_require_approval_mode_pauses_calls_whose_arguments_need_conversio
 
 async def test_classification_errors_fail_the_run_without_running_the_tool() -> None:
     calls: list[str] = []
-    client = MagicMock()
-    client.decisions.create = AsyncMock(side_effect=RuntimeError("decisions unavailable"))
+    client = make_client(RuntimeError("decisions unavailable"))
     auto_mode = OpenAIAutoMode(model=OpenAIDecisions("gpt-6-luna", openai_client=client))
     [guarded] = auto_mode.guard([delete_file_tool(calls)])
 
@@ -438,3 +438,43 @@ async def test_classification_keeps_json_schemas_from_replayed_history() -> None
     assert result.final_output == "done"
     payload = json.loads(client.decisions.create.await_args.kwargs["input"])
     assert payload["messages"][0]["tools"][0]["input_schema"] == schema
+
+
+async def test_classification_uses_the_namespaced_tool_name() -> None:
+    calls: list[str] = []
+    decisions, client = risk_decisions(0.9)
+    [guarded] = OpenAIAutoMode(model=decisions).guard(
+        tool_namespace(name="files", description="File tools.", tools=[delete_file_tool(calls)])
+    )
+    model = ScriptedModel(
+        [
+            [
+                function_call(
+                    "delete_file", '{"path": "a.txt"}', call_id="call_1", namespace="files"
+                )
+            ],
+            [get_text_message("done")],
+        ]
+    )
+
+    result = await Runner.run(
+        Agent(name="assistant", model=model, tools=[guarded]), "hi", run_config=CONFIG
+    )
+
+    payload = json.loads(client.decisions.create.await_args.kwargs["input"])
+    assert payload["tool_call"]["name"] == "files.delete_file"
+    outputs = [item.output for item in result.new_items if isinstance(item, ToolCallOutputItem)]
+    assert outputs[0].startswith("The tool call `files.delete_file` was blocked")
+
+
+async def test_classification_sends_only_the_latest_run_input_items() -> None:
+    decisions, client = risk_decisions(0.1)
+    [guarded] = OpenAIAutoMode(model=decisions).guard([delete_file_tool([])])
+    history: list[Any] = [{"role": "user", "content": f"message {index}"} for index in range(31)]
+
+    await Runner.run(agent_calling(guarded, '{"path": "a.txt"}'), history, run_config=CONFIG)
+
+    payload = json.loads(client.decisions.create.await_args.kwargs["input"])
+    assert [item["content"] for item in payload["messages"]] == [
+        f"message {index}" for index in range(1, 31)
+    ]

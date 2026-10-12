@@ -28,6 +28,7 @@ from openai.types.decision_create_params import (
     QuestionQuestionParamScoreLevel,
 )
 
+from .._tool_identity import get_function_tool_trace_name
 from ..exceptions import UserError
 from ..run_context import RunContextWrapper
 from ..tool import FunctionTool
@@ -37,6 +38,7 @@ from ..tool_guardrails import (
     ToolInputGuardrailData,
 )
 from ._openai_shared import get_default_openai_client, get_default_openai_key
+from .openai_provider import shared_http_client
 
 
 @dataclass(frozen=True)
@@ -167,7 +169,7 @@ class OpenAIDecisions:
         # The client is created on first use so that construction does not require an API key.
         if self._client is None:
             self._client = get_default_openai_client() or AsyncOpenAI(
-                api_key=get_default_openai_key()
+                api_key=get_default_openai_key(), http_client=shared_http_client()
             )
         return self._client
 
@@ -214,6 +216,9 @@ DEFAULT_AUTO_MODE_INSTRUCTIONS = (
     "request. Answer no if the call is low risk, reversible, and clearly authorized by the user."
 )
 
+# Matches LangChain's cap, keeping long sessions within the classifier's input limit.
+_MAX_CONTEXT_ITEMS = 30
+
 _MEDIA_TYPES = frozenset(
     {"input_image", "input_file", "input_audio", "computer_screenshot", "image_generation_call"}
 )
@@ -245,7 +250,9 @@ class OpenAIAutoMode:
     the outer agent tool instead of the inner agent's tools. With `on_risky="require_approval"`,
     calls whose arguments the SDK has to convert (for example enums, dates, or omitted defaults)
     always require approval without being classified; use `on_risky="reject_content"` to classify
-    every call.
+    every call. Media in the conversation (images, files, audio, screenshots) is replaced by
+    placeholders and only the latest 30 input items are sent, so authorization given only inside an
+    attachment or in older history is not seen.
     """
 
     def __init__(
@@ -289,22 +296,24 @@ class OpenAIAutoMode:
             async def needs_approval(
                 context: RunContextWrapper[Any], arguments: dict[str, Any], _call_id: str
             ) -> bool:
-                probability = await self._risk(context, tool, json.dumps(arguments))
+                name = get_function_tool_trace_name(tool) or tool.name
+                probability = await self._risk(context, name, tool, json.dumps(arguments))
                 return probability is None or probability >= self._threshold
 
             guarded.needs_approval = needs_approval
             return guarded
 
         async def check_risk(data: ToolInputGuardrailData) -> ToolGuardrailFunctionOutput:
-            probability = await self._risk(data.context, tool, data.context.tool_arguments)
+            name = data.context.qualified_tool_name
+            probability = await self._risk(data.context, name, tool, data.context.tool_arguments)
             if probability is None:
                 return ToolGuardrailFunctionOutput.reject_content(
-                    f"The tool call `{tool.name}` was blocked because its risk could not be "
+                    f"The tool call `{name}` was blocked because its risk could not be "
                     "assessed. The tool was not executed."
                 )
             if probability >= self._threshold:
                 return ToolGuardrailFunctionOutput.reject_content(
-                    f"The tool call `{tool.name}` was blocked because it was classified as risky "
+                    f"The tool call `{name}` was blocked because it was classified as risky "
                     f"(probability: {probability:.2f}). The tool was not executed.",
                     output_info=probability,
                 )
@@ -318,13 +327,13 @@ class OpenAIAutoMode:
         return guarded
 
     async def _risk(
-        self, context: RunContextWrapper[Any], tool: FunctionTool, arguments: str
+        self, context: RunContextWrapper[Any], name: str, tool: FunctionTool, arguments: str
     ) -> float | None:
         """Return the probability that the call is risky, or None if the model refused."""
         payload = json.dumps(
             {
-                "messages": _omit_media(context.turn_input),
-                "tool_call": {"name": tool.name, "arguments": arguments},
+                "messages": _omit_media(context.turn_input[-_MAX_CONTEXT_ITEMS:]),
+                "tool_call": {"name": name, "arguments": arguments},
                 "tool_description": tool.description,
             },
             ensure_ascii=False,
