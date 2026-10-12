@@ -278,7 +278,11 @@ class OpenAIAutoMode:
         self._on_risky = on_risky
 
     def guard(self, tools: list[FunctionTool]) -> list[FunctionTool]:
-        """Return copies of `tools` that are classified before every call."""
+        """Return copies of `tools` that are classified before every call.
+
+        Apply `tool_namespace()` before `guard()`, so that approval mode classifies calls under the
+        namespaced tool name.
+        """
         for tool in tools:
             if not isinstance(tool, FunctionTool):
                 raise UserError("OpenAIAutoMode.guard() only supports FunctionTool instances.")
